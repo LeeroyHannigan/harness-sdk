@@ -16,6 +16,7 @@ from openai.types.chat.parsed_chat_completion import ParsedChatCompletion
 from pydantic import BaseModel
 from typing_extensions import Unpack, override
 
+from ..agent.agent_metadata import AgentMetadata
 from ..types.content import ContentBlock, Messages, SystemContentBlock
 from ..types.event_loop import Usage
 from ..types.exceptions import ContextWindowOverflowException, ModelThrottledException
@@ -23,9 +24,10 @@ from ..types.streaming import StreamEvent
 from ..types.tools import ToolChoice, ToolResult, ToolSpec, ToolUse
 from ._defaults import resolve_config_metadata
 from ._openai_bedrock import BedrockMantleConfig, resolve_bedrock_client_args
+from ._openai_cache import apply_cache_config
 from ._openai_errors import classify_openai_error
 from ._validation import _has_location_source, validate_config_keys
-from .model import BaseModelConfig, Model
+from .model import BaseModelConfig, CacheConfig, Model
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +59,16 @@ class OpenAIModel(Model):
                 For a complete list of supported parameters, see
                 https://platform.openai.com/docs/api-reference/chat/create.
             stream: Whether to use OpenAI chat completion streaming. Defaults to True.
+            cache_config: Prompt-caching configuration. OpenAI routes cache reads on
+                ``cache_key`` (mapped to ``prompt_cache_key``) and honors ``ttl`` only when it names
+                an OpenAI retention value; other fields have no effect. An explicit
+                ``prompt_cache_key``/``prompt_cache_retention`` in ``params`` takes precedence.
         """
 
         model_id: str
         params: dict[str, Any] | None
         stream: bool
+        cache_config: CacheConfig | None
 
     def __init__(
         self,
@@ -87,10 +94,12 @@ class OpenAIModel(Model):
                 May be combined with ``bedrock_mantle_config``; when both are set,
                 ``bedrock_mantle_config`` derives ``base_url`` and ``api_key`` (which must not
                 appear in ``client_args``).
-            bedrock_mantle_config: Route requests through Amazon Bedrock's Mantle
-                (OpenAI-compatible) endpoint. See :class:`BedrockMantleConfig` for accepted
-                keys. When set, a fresh bearer token is minted on every request. Cannot be
-                combined with a pre-built ``client``.
+            bedrock_mantle_config: Route requests through one of Amazon Bedrock's
+                OpenAI-compatible endpoints, ``bedrock-mantle`` (the default) or
+                ``bedrock-runtime`` via the config's ``endpoint`` key. See
+                :class:`BedrockMantleConfig` for accepted keys. When set, a fresh bearer
+                token is minted on every request. Cannot be combined with a pre-built
+                ``client``.
             **model_config: Configuration options for the OpenAI model.
 
         Raises:
@@ -480,6 +489,7 @@ class OpenAIModel(Model):
         tool_choice: ToolChoice | None = None,
         *,
         system_prompt_content: list[SystemContentBlock] | None = None,
+        agent_metadata: AgentMetadata | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Format an OpenAI compatible chat streaming request.
@@ -490,6 +500,7 @@ class OpenAIModel(Model):
             system_prompt: System prompt to provide context to the model.
             tool_choice: Selection strategy for tool invocation.
             system_prompt_content: System prompt content blocks to provide context to the model.
+            agent_metadata: Invoking agent's metadata.
             **kwargs: Additional keyword arguments for future extensibility.
 
         Returns:
@@ -526,6 +537,8 @@ class OpenAIModel(Model):
 
         if stream:
             request["stream_options"] = stream_options
+
+        apply_cache_config(request, cast(CacheConfig | None, self.config.get("cache_config")), agent_metadata)
 
         return request
 
@@ -681,6 +694,7 @@ class OpenAIModel(Model):
         system_prompt: str | None = None,
         *,
         tool_choice: ToolChoice | None = None,
+        agent_metadata: AgentMetadata | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream conversation with the OpenAI model.
@@ -690,6 +704,7 @@ class OpenAIModel(Model):
             tool_specs: List of tool specifications to make available to the model.
             system_prompt: System prompt to provide context to the model.
             tool_choice: Selection strategy for tool invocation.
+            agent_metadata: Invoking agent's identity, used to derive a prompt-cache routing key.
             **kwargs: Additional keyword arguments for future extensibility.
 
         Yields:
@@ -700,7 +715,7 @@ class OpenAIModel(Model):
             ModelThrottledException: If the request is throttled by OpenAI (rate limits).
         """
         logger.debug("formatting request")
-        request = self.format_request(messages, tool_specs, system_prompt, tool_choice)
+        request = self.format_request(messages, tool_specs, system_prompt, tool_choice, agent_metadata=agent_metadata)
         logger.debug("formatted request=<%s>", request)
 
         logger.debug("invoking model")
